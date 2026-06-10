@@ -1,0 +1,425 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>PIXEL PONG</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        html, body {
+            width: 100%; height: 100%;
+            background: #000;
+            display: flex; align-items: center; justify-content: center;
+            overflow: hidden;
+            touch-action: none;
+            user-select: none;
+            -webkit-user-select: none;
+        }
+        canvas {
+            display: block;
+            image-rendering: pixelated;
+            image-rendering: crisp-edges;
+        }
+    </style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+'use strict';
+
+var canvas = document.getElementById('c');
+var ctx    = canvas.getContext('2d');
+
+// ── Dimensions ──────────────────────────────────────────────────────────────
+var W = 800, H = 600;
+canvas.width = W;
+canvas.height = H;
+
+var scale = 1;
+function resize() {
+    scale = Math.min(window.innerWidth / W, window.innerHeight / H);
+    canvas.style.width  = (W * scale) + 'px';
+    canvas.style.height = (H * scale) + 'px';
+}
+window.addEventListener('resize', resize);
+resize();
+
+// ── Palette ─────────────────────────────────────────────────────────────────
+var C = {
+    bg:    '#040804',
+    green: '#39ff14',
+    mid:   '#1aaa09',
+    dim:   '#082d03',
+    white: '#f0fff0',
+    ball:  '#ffffff'
+};
+
+// ── Audio ───────────────────────────────────────────────────────────────────
+var AC = null;
+try { AC = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) {}
+
+function beep(freq, dur, vol, type) {
+    vol  = vol  || 0.12;
+    type = type || 'square';
+    if (!AC) return;
+    try {
+        var o = AC.createOscillator();
+        var g = AC.createGain();
+        o.connect(g); g.connect(AC.destination);
+        o.type = type;
+        o.frequency.value = freq;
+        g.gain.setValueAtTime(vol, AC.currentTime);
+        g.gain.exponentialRampToValueAtTime(0.001, AC.currentTime + dur);
+        o.start(); o.stop(AC.currentTime + dur);
+    } catch (e) {}
+}
+function resumeAudio() { if (AC && AC.state === 'suspended') AC.resume(); }
+
+// ── Constantes ───────────────────────────────────────────────────────────────
+var PW = 14, PH = 90, PS = 6.5;   // paddle : largeur, hauteur, vitesse
+var BS = 14;                        // balle
+var WIN_SCORE = 7;
+var FONT = "'Courier New', Courier, monospace";
+
+// ── Entités ──────────────────────────────────────────────────────────────────
+var p1   = { x: 40,           y: H / 2 - PH / 2, score: 0 };
+var p2   = { x: W - 40 - PW, y: H / 2 - PH / 2, score: 0 };
+var ball = { x: W / 2, y: H / 2, vx: 0, vy: 0, speed: 5.5 };
+
+function resetBall(dir) {
+    ball.x = W / 2; ball.y = H / 2;
+    ball.speed = 5.5;
+    var a = (Math.random() * 0.5 - 0.25) * Math.PI;
+    var d = (dir !== undefined) ? dir : (Math.random() < 0.5 ? 1 : -1);
+    ball.vx = Math.cos(a) * ball.speed * d;
+    ball.vy = Math.sin(a) * ball.speed;
+}
+
+function fullReset() {
+    p1.score = 0; p2.score = 0;
+    p1.y = H / 2 - PH / 2;
+    p2.y = H / 2 - PH / 2;
+    resetBall();
+}
+
+// ── Clavier ──────────────────────────────────────────────────────────────────
+var keys = {};
+window.addEventListener('keydown', function (e) {
+    keys[e.key] = true;
+    if (['ArrowUp','ArrowDown','ArrowLeft','ArrowRight',' '].indexOf(e.key) !== -1)
+        e.preventDefault();
+    if ((state === 'menu' || state === 'gameover') && (e.key === ' ' || e.key === 'Enter'))
+        launch();
+    resumeAudio();
+});
+window.addEventListener('keyup', function (e) { keys[e.key] = false; });
+
+// ── Tactile (4 quadrants) ─────────────────────────────────────────────────────
+var tp = { p1u: 0, p1d: 0, p2u: 0, p2d: 0 };
+
+function applyTouches(e) {
+    tp.p1u = tp.p1d = tp.p2u = tp.p2d = 0;
+    var r = canvas.getBoundingClientRect();
+    for (var i = 0; i < e.touches.length; i++) {
+        var t  = e.touches[i];
+        var tx = (t.clientX - r.left) / scale;
+        var ty = (t.clientY - r.top)  / scale;
+        if (tx < W / 2) { if (ty < H / 2) tp.p1u++; else tp.p1d++; }
+        else             { if (ty < H / 2) tp.p2u++; else tp.p2d++; }
+    }
+}
+
+canvas.addEventListener('touchstart', function (e) {
+    e.preventDefault();
+    applyTouches(e);
+    resumeAudio();
+    if (state === 'menu' || state === 'gameover') launch();
+}, { passive: false });
+
+canvas.addEventListener('touchmove', function (e) {
+    e.preventDefault();
+    applyTouches(e);
+}, { passive: false });
+
+canvas.addEventListener('touchend', function (e) {
+    e.preventDefault();
+    applyTouches(e);
+}, { passive: false });
+
+// ── Machine à états ───────────────────────────────────────────────────────────
+var state       = 'menu';
+var pauseFrames = 0;
+var pauseDir    = 1;
+var frame       = 0;
+
+function launch() {
+    if (state === 'gameover') fullReset();
+    state = 'playing';
+    resetBall();
+}
+
+function scored(who) {
+    if (who === 1) { p1.score++; pauseDir = -1; }
+    else           { p2.score++; pauseDir =  1; }
+    beep(160, 0.55, 0.18, 'sawtooth');
+    if (p1.score >= WIN_SCORE || p2.score >= WIN_SCORE) {
+        state = 'gameover';
+    } else {
+        state = 'pause';
+        pauseFrames = 90;
+    }
+}
+
+function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+
+// ── Update ────────────────────────────────────────────────────────────────────
+function update() {
+    frame++;
+
+    if (state === 'pause') {
+        if (--pauseFrames <= 0) { state = 'playing'; resetBall(pauseDir); }
+        return;
+    }
+    if (state !== 'playing') return;
+
+    // Raquettes  — J1: Z=haut S=bas   J2: ↑=haut ↓=bas
+    if ((keys['z'] || keys['Z'] || tp.p1u > 0) && p1.y > 0)         p1.y -= PS;
+    if ((keys['s'] || keys['S'] || tp.p1d > 0) && p1.y < H - PH)    p1.y += PS;
+    if ((keys['ArrowUp']   || tp.p2u > 0)       && p2.y > 0)         p2.y -= PS;
+    if ((keys['ArrowDown'] || tp.p2d > 0)       && p2.y < H - PH)    p2.y += PS;
+
+    // Balle
+    ball.x += ball.vx;
+    ball.y += ball.vy;
+
+    // Murs haut / bas
+    if (ball.y < 0)        { ball.y = 0;      ball.vy =  Math.abs(ball.vy); beep(300, 0.07); }
+    if (ball.y + BS > H)   { ball.y = H - BS; ball.vy = -Math.abs(ball.vy); beep(300, 0.07); }
+
+    // Collision raquette J1
+    if (ball.vx < 0 &&
+        ball.x        <= p1.x + PW && ball.x + BS > p1.x &&
+        ball.y + BS   >  p1.y      && ball.y      < p1.y + PH) {
+        var r1  = clamp((ball.y + BS / 2 - p1.y - PH / 2) / (PH / 2), -1, 1);
+        var a1  = r1 * 0.38 * Math.PI;
+        ball.speed = Math.min(ball.speed + 0.4, 15);
+        ball.vx =  Math.abs(Math.cos(a1) * ball.speed);
+        ball.vy =  Math.sin(a1) * ball.speed;
+        ball.x  =  p1.x + PW + 1;
+        beep(440, 0.06);
+    }
+
+    // Collision raquette J2
+    if (ball.vx > 0 &&
+        ball.x + BS >= p2.x && ball.x        < p2.x + PW &&
+        ball.y + BS >  p2.y && ball.y        < p2.y + PH) {
+        var r2  = clamp((ball.y + BS / 2 - p2.y - PH / 2) / (PH / 2), -1, 1);
+        var a2  = r2 * 0.38 * Math.PI;
+        ball.speed = Math.min(ball.speed + 0.4, 15);
+        ball.vx = -Math.abs(Math.cos(a2) * ball.speed);
+        ball.vy =  Math.sin(a2) * ball.speed;
+        ball.x  =  p2.x - BS - 1;
+        beep(560, 0.06);
+    }
+
+    // Point
+    if (ball.x + BS < 0) scored(2);
+    if (ball.x > W)      scored(1);
+}
+
+// ── Dessin ────────────────────────────────────────────────────────────────────
+function fill(x, y, w, h, color) {
+    ctx.fillStyle = color;
+    ctx.fillRect(~~x, ~~y, w, h);
+}
+
+function txt(s, x, y, sz, color, align) {
+    align = align || 'center';
+    ctx.save();
+    ctx.font         = 'bold ' + sz + 'px ' + FONT;
+    ctx.fillStyle    = color;
+    ctx.textAlign    = align;
+    ctx.textBaseline = 'top';
+    // ombre pixel
+    ctx.fillStyle = '#001500';
+    ctx.fillText(s, x + 2, y + 2);
+    ctx.fillStyle = color;
+    ctx.fillText(s, x, y);
+    ctx.restore();
+}
+
+function withGlow(fn) {
+    ctx.save();
+    ctx.shadowColor = C.green;
+    ctx.shadowBlur  = 22;
+    fn();
+    ctx.restore();
+}
+
+function drawField() {
+    fill(0, 0, W, H, C.bg);
+    // Bordure
+    ctx.strokeStyle = C.dim;
+    ctx.lineWidth   = 2;
+    ctx.strokeRect(2, 2, W - 4, H - 4);
+    // Ligne centrale pointillée
+    for (var y = 12; y < H; y += 28) fill(W / 2 - 3, y, 6, 16, C.dim);
+}
+
+function drawPaddle(p) {
+    withGlow(function () {
+        fill(p.x, p.y, PW, PH, C.green);
+        fill(p.x, p.y, 2, PH, '#80ff60');
+    });
+}
+
+function drawBall() {
+    withGlow(function () { fill(ball.x, ball.y, BS, BS, C.ball); });
+}
+
+function drawScores() {
+    withGlow(function () {
+        txt(p1.score, W * 0.27, 14, 52, C.green);
+        txt(p2.score, W * 0.73, 14, 52, C.green);
+    });
+}
+
+function drawScanlines() {
+    ctx.save();
+    ctx.globalAlpha = 0.04;
+    for (var y = 0; y < H; y += 3) {
+        ctx.fillStyle = '#000';
+        ctx.fillRect(0, y, W, 1);
+    }
+    ctx.globalAlpha = 0.2;
+    var gr = ctx.createRadialGradient(W / 2, H / 2, H * 0.28, W / 2, H / 2, H * 0.84);
+    gr.addColorStop(0, 'rgba(0,0,0,0)');
+    gr.addColorStop(1, 'rgba(0,0,0,1)');
+    ctx.fillStyle = gr;
+    ctx.fillRect(0, 0, W, H);
+    ctx.restore();
+}
+
+function drawTouchHints() {
+    if (!(navigator.maxTouchPoints > 0)) return;
+    ctx.save();
+    ctx.globalAlpha = 0.1;
+    ctx.strokeStyle = C.green;
+    ctx.lineWidth   = 1;
+    ctx.setLineDash([3, 10]);
+    ctx.beginPath(); ctx.moveTo(4,         H / 2); ctx.lineTo(W / 2 - 5, H / 2); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(W / 2 + 5, H / 2); ctx.lineTo(W - 4,    H / 2); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.globalAlpha  = 0.2;
+    ctx.fillStyle    = C.green;
+    ctx.font         = '22px monospace';
+    ctx.textAlign    = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText('▲', W * 0.18, H * 0.25);
+    ctx.fillText('▼', W * 0.18, H * 0.75);
+    ctx.fillText('▲', W * 0.82, H * 0.25);
+    ctx.fillText('▼', W * 0.82, H * 0.75);
+    ctx.restore();
+}
+
+// ── Écrans ────────────────────────────────────────────────────────────────────
+function drawMenu() {
+    drawField();
+    // Raquettes déco
+    fill(p1.x, H / 2 - PH / 2, PW, PH, C.dim);
+    fill(p2.x, H / 2 - PH / 2, PW, PH, C.dim);
+
+    withGlow(function () {
+        txt('PIXEL PONG', W / 2, 100, 52, C.green);
+    });
+    txt('RETRO EDITION', W / 2, 168, 14, C.mid);
+
+    // Séparateur
+    fill(W * 0.15, 210, W * 0.70, 1, C.dim);
+
+    // Contrôles
+    txt('JOUEUR 1', W * 0.28, 228, 13, C.green);
+    txt('Z  ▲   S  ▼', W * 0.28, 254, 11, '#88ff88');
+
+    txt('JOUEUR 2', W * 0.72, 228, 13, C.green);
+    txt('↑  ▲   ↓  ▼', W * 0.72, 254, 11, '#88ff88');
+
+    // Tactile
+    if (navigator.maxTouchPoints > 0) {
+        txt('TACTILE : TOUCHER HAUT/BAS DE CHAQUE COTE', W / 2, 295, 7, C.dim);
+    }
+
+    fill(W * 0.15, 322, W * 0.70, 1, C.dim);
+
+    txt('PREMIER A ' + WIN_SCORE + ' POINTS GAGNE', W / 2, 338, 10, C.dim);
+
+    if ((frame >> 5) & 1) {
+        withGlow(function () {
+            txt('APPUYER SUR ESPACE', W / 2, 390, 13, C.green);
+            txt('OU TOUCHER L\'ECRAN', W / 2, 418, 13, C.mid);
+        });
+    }
+
+    // Logo pixel balle
+    withGlow(function () { fill(W / 2 - BS / 2, 478, BS, BS, C.ball); });
+
+    drawScanlines();
+}
+
+function drawPlaying() {
+    drawField();
+    drawScores();
+    drawPaddle(p1);
+    drawPaddle(p2);
+    drawBall();
+    drawTouchHints();
+    drawScanlines();
+}
+
+function drawPause() {
+    drawField();
+    drawScores();
+    drawPaddle(p1);
+    drawPaddle(p2);
+    if ((frame >> 2) & 1) {
+        withGlow(function () { txt('POINT !', W / 2, H / 2 - 22, 34, C.green); });
+    }
+    drawScanlines();
+}
+
+function drawGameOver() {
+    drawField();
+    var winner = (p1.score >= WIN_SCORE) ? 'JOUEUR  1' : 'JOUEUR  2';
+    withGlow(function () {
+        txt('GAME OVER',        W / 2, 118, 36, C.green);
+        txt(winner + ' GAGNE', W / 2, 200, 20, C.white);
+    });
+    txt(p1.score + '   -   ' + p2.score, W / 2, 265, 30, C.green);
+
+    if ((frame >> 5) & 1) {
+        withGlow(function () {
+            txt('REJOUER ?',           W / 2, 360, 14, C.green);
+            txt('ESPACE OU TOUCHER',   W / 2, 390, 10, C.mid);
+        });
+    }
+    drawScanlines();
+}
+
+// ── Boucle ────────────────────────────────────────────────────────────────────
+function loop() {
+    update();
+    if      (state === 'menu')     drawMenu();
+    else if (state === 'playing')  drawPlaying();
+    else if (state === 'pause')    drawPause();
+    else if (state === 'gameover') drawGameOver();
+    requestAnimationFrame(loop);
+}
+
+fullReset();
+loop();
+
+})();
+</script>
+</body>
+</html>
