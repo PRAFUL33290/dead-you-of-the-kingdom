@@ -1,0 +1,436 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>PIXEL PONG</title>
+    <link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap" rel="stylesheet">
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        html, body {
+            width: 100%; height: 100%;
+            background: #000;
+            display: flex; align-items: center; justify-content: center;
+            overflow: hidden;
+            touch-action: none;
+            user-select: none;
+        }
+        canvas {
+            display: block;
+            image-rendering: pixelated;
+            image-rendering: crisp-edges;
+        }
+    </style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+'use strict';
+
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+
+// ── Dimensions ──────────────────────────────────────────────────────────────
+const W = 800, H = 600;
+canvas.width = W; canvas.height = H;
+
+let scale = 1;
+function resize() {
+    scale = Math.min(innerWidth / W, innerHeight / H);
+    canvas.style.width  = W * scale + 'px';
+    canvas.style.height = H * scale + 'px';
+}
+addEventListener('resize', resize);
+resize();
+
+// ── Palette CRT verte ───────────────────────────────────────────────────────
+const C = {
+    bg:    '#040804',
+    green: '#39ff14',
+    mid:   '#1db30a',
+    dim:   '#082d03',
+    white: '#f0fff0',
+    ball:  '#ffffff',
+};
+
+// ── Audio (Web Audio API) ───────────────────────────────────────────────────
+let AC;
+try { AC = new (window.AudioContext || window.webkitAudioContext)(); } catch (_) {}
+
+function beep(freq, dur, vol = 0.12, type = 'square') {
+    if (!AC) return;
+    try {
+        const o = AC.createOscillator();
+        const g = AC.createGain();
+        o.connect(g); g.connect(AC.destination);
+        o.type = type;
+        o.frequency.value = freq;
+        g.gain.setValueAtTime(vol, AC.currentTime);
+        g.gain.exponentialRampToValueAtTime(0.001, AC.currentTime + dur);
+        o.start(); o.stop(AC.currentTime + dur);
+    } catch (_) {}
+}
+
+function resumeAudio() {
+    if (AC && AC.state === 'suspended') AC.resume();
+}
+
+// ── Constantes de jeu ───────────────────────────────────────────────────────
+const PW = 14, PH = 90, PS = 6.5;  // paddle : largeur, hauteur, vitesse
+const BS = 14;                       // taille de la balle
+const WIN_SCORE = 7;
+
+// ── Entités ─────────────────────────────────────────────────────────────────
+const p1   = { x: 40,           y: H / 2 - PH / 2, score: 0 };
+const p2   = { x: W - 40 - PW, y: H / 2 - PH / 2, score: 0 };
+const ball = { x: W / 2, y: H / 2, vx: 0, vy: 0, speed: 5.5 };
+
+function resetBall(dir) {
+    ball.x = W / 2; ball.y = H / 2;
+    ball.speed = 5.5;
+    const a = (Math.random() * 0.5 - 0.25) * Math.PI;
+    const d = dir !== undefined ? dir : (Math.random() < 0.5 ? 1 : -1);
+    ball.vx = Math.cos(a) * ball.speed * d;
+    ball.vy = Math.sin(a) * ball.speed;
+}
+
+function fullReset() {
+    p1.score = 0; p2.score = 0;
+    p1.y = H / 2 - PH / 2;
+    p2.y = H / 2 - PH / 2;
+    resetBall();
+}
+
+// ── Clavier ─────────────────────────────────────────────────────────────────
+const keys = new Set();
+addEventListener('keydown', e => {
+    keys.add(e.key);
+    if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', ' '].includes(e.key))
+        e.preventDefault();
+    if (['menu', 'gameover'].includes(state) &&
+        (e.key === ' ' || e.key === 'Enter')) launch();
+    resumeAudio();
+});
+addEventListener('keyup', e => keys.delete(e.key));
+
+// ── Tactile (4 quadrants) ───────────────────────────────────────────────────
+const tp = { p1u: 0, p1d: 0, p2u: 0, p2d: 0 };
+
+function applyTouches(e) {
+    tp.p1u = tp.p1d = tp.p2u = tp.p2d = 0;
+    const r = canvas.getBoundingClientRect();
+    for (const t of e.touches) {
+        const tx = (t.clientX - r.left) / scale;
+        const ty = (t.clientY - r.top)  / scale;
+        if (tx < W / 2) { ty < H / 2 ? tp.p1u++ : tp.p1d++; }
+        else            { ty < H / 2 ? tp.p2u++ : tp.p2d++; }
+    }
+}
+
+canvas.addEventListener('touchstart', e => {
+    e.preventDefault();
+    applyTouches(e);
+    resumeAudio();
+    if (['menu', 'gameover'].includes(state)) launch();
+}, { passive: false });
+
+canvas.addEventListener('touchmove', e => {
+    e.preventDefault();
+    applyTouches(e);
+}, { passive: false });
+
+canvas.addEventListener('touchend', e => {
+    e.preventDefault();
+    applyTouches(e);
+}, { passive: false });
+
+// ── Machine à états ─────────────────────────────────────────────────────────
+let state = 'menu';   // menu | playing | pause | gameover
+let pauseFrames = 0;
+let pauseDir = 1;
+let frame = 0;
+
+function launch() {
+    if (state === 'gameover') fullReset();
+    state = 'playing';
+    resetBall();
+}
+
+function scored(who) {
+    if (who === 1) { p1.score++; pauseDir = -1; }
+    else           { p2.score++; pauseDir =  1; }
+    beep(160, 0.55, 0.18, 'sawtooth');
+    if (p1.score >= WIN_SCORE || p2.score >= WIN_SCORE) {
+        state = 'gameover';
+    } else {
+        state = 'pause';
+        pauseFrames = 90;
+    }
+}
+
+function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+
+// ── Mise à jour ─────────────────────────────────────────────────────────────
+function update() {
+    frame++;
+
+    if (state === 'pause') {
+        if (--pauseFrames <= 0) { state = 'playing'; resetBall(pauseDir); }
+        return;
+    }
+    if (state !== 'playing') return;
+
+    // Déplacement raquettes
+    // J1 : Z = haut, S = bas  (AZERTY : ZQSD → équivalent WASD)
+    if ((keys.has('z') || keys.has('Z') || tp.p1u > 0) && p1.y > 0)
+        p1.y -= PS;
+    if ((keys.has('s') || keys.has('S') || tp.p1d > 0) && p1.y < H - PH)
+        p1.y += PS;
+
+    // J2 : flèches directionnelles
+    if ((keys.has('ArrowUp')   || tp.p2u > 0) && p2.y > 0)
+        p2.y -= PS;
+    if ((keys.has('ArrowDown') || tp.p2d > 0) && p2.y < H - PH)
+        p2.y += PS;
+
+    // Déplacement balle
+    ball.x += ball.vx;
+    ball.y += ball.vy;
+
+    // Murs haut / bas
+    if (ball.y < 0) {
+        ball.y = 0;
+        ball.vy = Math.abs(ball.vy);
+        beep(300, 0.07);
+    }
+    if (ball.y + BS > H) {
+        ball.y = H - BS;
+        ball.vy = -Math.abs(ball.vy);
+        beep(300, 0.07);
+    }
+
+    // Collision raquette J1
+    if (ball.vx < 0 &&
+        ball.x <= p1.x + PW && ball.x + BS > p1.x &&
+        ball.y + BS > p1.y  && ball.y < p1.y + PH) {
+        const rel = clamp((ball.y + BS / 2 - p1.y - PH / 2) / (PH / 2), -1, 1);
+        const ang = rel * 0.38 * Math.PI;
+        ball.speed = Math.min(ball.speed + 0.4, 15);
+        ball.vx =  Math.abs(Math.cos(ang) * ball.speed);
+        ball.vy =  Math.sin(ang) * ball.speed;
+        ball.x  =  p1.x + PW + 1;
+        beep(440, 0.06);
+    }
+
+    // Collision raquette J2
+    if (ball.vx > 0 &&
+        ball.x + BS >= p2.x && ball.x < p2.x + PW &&
+        ball.y + BS > p2.y  && ball.y < p2.y + PH) {
+        const rel = clamp((ball.y + BS / 2 - p2.y - PH / 2) / (PH / 2), -1, 1);
+        const ang = rel * 0.38 * Math.PI;
+        ball.speed = Math.min(ball.speed + 0.4, 15);
+        ball.vx = -Math.abs(Math.cos(ang) * ball.speed);
+        ball.vy =  Math.sin(ang) * ball.speed;
+        ball.x  =  p2.x - BS - 1;
+        beep(560, 0.06);
+    }
+
+    // Points
+    if (ball.x + BS < 0)  scored(2);
+    if (ball.x > W)       scored(1);
+}
+
+// ── Dessin ───────────────────────────────────────────────────────────────────
+function fill(x, y, w, h, color) {
+    ctx.fillStyle = color;
+    ctx.fillRect(~~x, ~~y, w, h);
+}
+
+function txt(s, x, y, sz, color, align = 'center') {
+    ctx.save();
+    ctx.font         = `${sz}px 'Press Start 2P', 'Courier New', monospace`;
+    ctx.fillStyle    = color;
+    ctx.textAlign    = align;
+    ctx.textBaseline = 'top';
+    ctx.fillText(s, x, y);
+    ctx.restore();
+}
+
+function withGlow(fn) {
+    ctx.save();
+    ctx.shadowColor = C.green;
+    ctx.shadowBlur  = 20;
+    fn();
+    ctx.restore();
+}
+
+function drawField() {
+    fill(0, 0, W, H, C.bg);
+    ctx.strokeStyle = C.dim;
+    ctx.lineWidth   = 2;
+    ctx.strokeRect(2, 2, W - 4, H - 4);
+    for (let y = 12; y < H; y += 28) fill(W / 2 - 3, y, 6, 16, C.dim);
+}
+
+function drawPaddle(p) {
+    withGlow(() => {
+        fill(p.x, p.y, PW, PH, C.green);
+        fill(p.x, p.y, 2,  PH, '#80ff60');
+    });
+}
+
+function drawBall() {
+    withGlow(() => fill(ball.x, ball.y, BS, BS, C.ball));
+}
+
+function drawScores() {
+    withGlow(() => {
+        txt(p1.score, W * 0.27, 18, 44, C.green);
+        txt(p2.score, W * 0.73, 18, 44, C.green);
+    });
+}
+
+function drawScanlines() {
+    ctx.save();
+    ctx.globalAlpha = 0.045;
+    for (let y = 0; y < H; y += 3) { ctx.fillStyle = '#000'; ctx.fillRect(0, y, W, 1); }
+    ctx.globalAlpha = 0.22;
+    const gr = ctx.createRadialGradient(W / 2, H / 2, H * 0.28, W / 2, H / 2, H * 0.84);
+    gr.addColorStop(0, 'transparent');
+    gr.addColorStop(1, '#000000');
+    ctx.fillStyle = gr;
+    ctx.fillRect(0, 0, W, H);
+    ctx.restore();
+}
+
+function drawTouchHints() {
+    if (!(navigator.maxTouchPoints > 0)) return;
+    ctx.save();
+    ctx.globalAlpha = 0.1;
+    ctx.strokeStyle = C.green;
+    ctx.lineWidth   = 1;
+    ctx.setLineDash([3, 10]);
+    ctx.beginPath(); ctx.moveTo(4,       H / 2); ctx.lineTo(W / 2 - 5, H / 2); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(W / 2 + 5, H / 2); ctx.lineTo(W - 4, H / 2); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.globalAlpha  = 0.18;
+    ctx.fillStyle    = C.green;
+    ctx.font         = '22px monospace';
+    ctx.textAlign    = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText('▲', W * 0.18, H * 0.25);
+    ctx.fillText('▼', W * 0.18, H * 0.75);
+    ctx.fillText('▲', W * 0.82, H * 0.25);
+    ctx.fillText('▼', W * 0.82, H * 0.75);
+    ctx.restore();
+}
+
+// ── Écrans ───────────────────────────────────────────────────────────────────
+
+function drawMenu() {
+    drawField();
+    fill(p1.x, H / 2 - PH / 2, PW, PH, C.dim);
+    fill(p2.x, H / 2 - PH / 2, PW, PH, C.dim);
+
+    withGlow(() => {
+        txt('PIXEL', W / 2, 90,  54, C.green);
+        txt('PONG',  W / 2, 154, 54, C.green);
+    });
+
+    txt('RETRO  EDITION', W / 2, 228, 9, C.mid);
+
+    // Ligne de séparation
+    fill(W * 0.15, 270, W * 0.7, 1, C.dim);
+
+    // Contrôles J1
+    txt('J 1', W * 0.28, 292, 12, C.green);
+    txt('Z', W * 0.28 - 28, 316, 9, '#88ff88');
+    txt('▲', W * 0.28 - 28, 336, 9, C.mid);
+    txt('S', W * 0.28 + 28, 316, 9, '#88ff88');
+    txt('▼', W * 0.28 + 28, 336, 9, C.mid);
+
+    // Contrôles J2
+    txt('J 2', W * 0.72, 292, 12, C.green);
+    txt('↑', W * 0.72 - 28, 316, 9, '#88ff88');
+    txt('▲', W * 0.72 - 28, 336, 9, C.mid);
+    txt('↓', W * 0.72 + 28, 316, 9, '#88ff88');
+    txt('▼', W * 0.72 + 28, 336, 9, C.mid);
+
+    // Tactile
+    if (navigator.maxTouchPoints > 0) {
+        txt('TACTILE : TOUCHER LES ZONES', W / 2, 372, 6, C.dim);
+        txt('HAUT / BAS DE CHAQUE CÔTÉ',   W / 2, 386, 6, C.dim);
+    }
+
+    txt('PREMIER À ' + WIN_SCORE + ' POINTS GAGNE', W / 2, 418, 7, C.dim);
+
+    if ((frame >> 5) & 1) {
+        withGlow(() => {
+            txt('APPUYER SUR  ESPACE', W / 2, 460, 9, C.green);
+            txt('OU TOUCHER L\'ÉCRAN', W / 2, 482, 9, C.mid);
+        });
+    }
+
+    drawScanlines();
+}
+
+function drawPlaying() {
+    drawField();
+    drawScores();
+    drawPaddle(p1);
+    drawPaddle(p2);
+    drawBall();
+    drawTouchHints();
+    drawScanlines();
+}
+
+function drawPause() {
+    drawField();
+    drawScores();
+    drawPaddle(p1);
+    drawPaddle(p2);
+    if ((frame >> 2) & 1) {
+        withGlow(() => txt('POINT !', W / 2, H / 2 - 22, 28, C.green));
+    }
+    drawScanlines();
+}
+
+function drawGameOver() {
+    drawField();
+    const winner = p1.score >= WIN_SCORE ? 'JOUEUR  1' : 'JOUEUR  2';
+
+    withGlow(() => {
+        txt('GAME  OVER',    W / 2, 112, 30, C.green);
+        txt(winner,          W / 2, 196, 18, C.white);
+        txt('GAGNE !',       W / 2, 228, 18, C.white);
+    });
+
+    txt(p1.score + '   —   ' + p2.score, W / 2, 295, 26, C.green);
+
+    if ((frame >> 5) & 1) {
+        withGlow(() => {
+            txt('REJOUER ?',          W / 2, 385, 11, C.green);
+            txt('ESPACE OU TOUCHER',  W / 2, 412, 8,  C.mid);
+        });
+    }
+
+    drawScanlines();
+}
+
+// ── Boucle principale ────────────────────────────────────────────────────────
+function loop() {
+    update();
+    switch (state) {
+        case 'menu':     drawMenu();     break;
+        case 'playing':  drawPlaying();  break;
+        case 'pause':    drawPause();    break;
+        case 'gameover': drawGameOver(); break;
+    }
+    requestAnimationFrame(loop);
+}
+
+fullReset();
+loop();
+</script>
+</body>
+</html>
